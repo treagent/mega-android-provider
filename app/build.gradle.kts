@@ -45,12 +45,8 @@ android {
     }
 
     sourceSets {
-        getByName("main") {
-            kotlin.srcDirs("src/main/kotlin")
-        }
-        getByName("test") {
-            kotlin.srcDirs("src/test/kotlin")
-        }
+        getByName("main") { kotlin.srcDirs("src/main/kotlin") }
+        getByName("test") { kotlin.srcDirs("src/test/kotlin") }
     }
 }
 
@@ -61,14 +57,10 @@ dependencies {
     implementation("androidx.security:security-crypto:1.1.0-alpha06")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
 
-    // MEGA Android SDK — see README for setup instructions.
-    // Place the prebuilt SDK AAR in app/libs/ and uncomment:
-    // implementation(files("libs/megasdk-android.aar"))
-    //
-    // Or use JitPack if available:
-    // implementation("com.github.meganz:android:TAG")
-    //
-    // The code compiles against the nz.mega.sdk.* package (MegaApiJava, etc.).
+    // HTTP client — replaces native MEGA SDK
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
+
+    // No native MEGA SDK required — pure Kotlin HTTP implementation built in
 
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.mockito:mockito-core:5.8.0")
