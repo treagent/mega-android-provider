@@ -12,6 +12,7 @@ import java.io.File
 import java.io.FileOutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.security.MessageDigest
 import java.security.SecureRandom
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
@@ -39,7 +40,7 @@ class MegaApi {
         .writeTimeout(120, TimeUnit.SECONDS)
         .build()
 
-    private val seqno = AtomicInteger(SecureRandom().nextInt())
+    private val seqno = AtomicInteger(SecureRandom().nextInt().and(0x7FFFFFFF)) // must be positive
 
     var sessionId: String? = null
     var masterKey: IntArray? = null  // 4 uint32s
@@ -111,7 +112,8 @@ class MegaApi {
     private fun prepareKey(password: String): IntArray {
         val a = bytesToA32(password.toByteArray(Charsets.UTF_8))
         // Initial pkey constants from MEGA's reference implementation
-        var pkey = intArrayOf(0x93C467E3.toInt(), 0x7DB0C7A4, 0xD1BE3F81, 0x0152CB56)
+        // Signed int32 equivalents of: 0x93C467E3, 0x7DB0C7A4, 0xD1BE3F81, 0x0152CB56
+        var pkey = intArrayOf(-1815939101, 2108737444, -776855679, 22203222)
         repeat(0x10000) {           // 65536 rounds of key stretching
             var j = 0
             while (j < a.size) {
@@ -204,20 +206,103 @@ class MegaApi {
             if (sid != null) append("&sid=").append(sid)
         }
         val url = "https://g.api.mega.co.nz/cs?$params"
-        val body = JSONArray().put(data).toString()
-            .toRequestBody("application/json".toMediaType())
-        val req = Request.Builder().url(url).post(body).build()
-        val resp = http.newCall(req).execute()
-        val text = resp.body?.string() ?: throw MegaApiException(-1)
-        return try {
-            val arr = JSONArray(text)
-            val first = arr.get(0)
-            if (first is Int && first < 0) throw MegaApiException(first)
-            first
-        } catch (e: org.json.JSONException) {
-            val code = text.trim().toIntOrNull()
-            if (code != null && code < 0) throw MegaApiException(code)
-            null
+        val bodyStr = JSONArray().put(data).toString()
+
+        var hashcashHeader: String? = null
+
+        repeat(3) { attempt ->
+            val reqBuilder = Request.Builder().url(url)
+                .post(bodyStr.toRequestBody("application/json".toMediaType()))
+            hashcashHeader?.let { reqBuilder.header("X-Hashcash", it) }
+
+            val resp = http.newCall(reqBuilder.build()).execute()
+
+            if (resp.code == 402) {
+                // MEGA requires hashcash proof-of-work
+                val challenge = resp.header("X-Hashcash") ?: throw MegaApiException(-1)
+                resp.body?.close()
+                android.util.Log.d("MegaApi", "402 hashcash required: $challenge")
+                hashcashHeader = solveHashcash(challenge)
+                return@repeat // retry with hashcash header
+            }
+
+            val text = resp.body?.string() ?: throw MegaApiException(-1)
+            android.util.Log.d("MegaApi", "apiReq [${data.optString("a")}] → ${text.take(200)}")
+
+            return try {
+                val arr = JSONArray(text)
+                val first = arr.get(0)
+                val code = when (first) {
+                    is Int  -> first
+                    is Long -> first.toInt()
+                    else    -> null
+                }
+                if (code != null && code < 0) throw MegaApiException(code)
+                first
+            } catch (e: org.json.JSONException) {
+                val code = text.trim().toIntOrNull()
+                if (code != null && code < 0) throw MegaApiException(code)
+                null
+            }
+        }
+        throw MegaApiException(-3) // exhausted retries
+    }
+
+    // ── MEGA Hashcash (anti-abuse proof-of-work) ──────────────────────────
+    // Protocol from go-mega: https://github.com/t3rm1n4l/go-mega/blob/master/hashcash.go
+    // Header format: "1:easiness:timestamp:token"
+    // Response format: "1:token:cashValue"
+
+    private fun solveHashcash(header: String): String {
+        val parts = header.split(":")
+        if (parts.size != 4 || parts[0] != "1") throw MegaApiException(-1)
+        val easiness = parts[1].toIntOrNull() ?: throw MegaApiException(-1)
+        val token = parts[3]
+
+        val cashValue = computeHashcash(token, easiness)
+        return "1:$token:$cashValue"
+    }
+
+    private fun computeHashcash(token: String, easiness: Int): String {
+        // Threshold: first 4 bytes of SHA-256 must be ≤ this value (as unsigned uint32)
+        val base = ((easiness and 63) shl 1) + 1
+        val shift = (easiness shr 6) * 7 + 3
+        val threshold = (base.toLong() shl shift) and 0xFFFFFFFFL
+
+        // Decode + pad token to 16-byte boundary
+        val tokenRaw = b64Decode(token)
+        val rem = tokenRaw.size % 16
+        val tokenPadded = if (rem != 0) tokenRaw + ByteArray(16 - rem) else tokenRaw
+        val slotSize = tokenPadded.size  // 48 bytes for typical MEGA tokens
+
+        val numReplications = 262144
+        val buffer = ByteArray(4 + numReplications * slotSize)
+
+        // Fill buffer with replicated token
+        for (i in 0 until numReplications) {
+            System.arraycopy(tokenPadded, 0, buffer, 4 + i * slotSize, slotSize)
+        }
+
+        // Search for a 4-byte prefix whose SHA-256 satisfies the threshold
+        val sha = MessageDigest.getInstance("SHA-256")
+        var prefixInt = 0
+        while (true) {
+            buffer[0] = (prefixInt shr 24).toByte()
+            buffer[1] = (prefixInt shr 16).toByte()
+            buffer[2] = (prefixInt shr 8).toByte()
+            buffer[3] = prefixInt.toByte()
+
+            sha.reset()
+            val hash = sha.digest(buffer)
+            val hashVal = ((hash[0].toLong() and 0xFF) shl 24) or
+                          ((hash[1].toLong() and 0xFF) shl 16) or
+                          ((hash[2].toLong() and 0xFF) shl 8) or
+                          (hash[3].toLong() and 0xFF)
+
+            if (hashVal <= threshold) {
+                return b64Encode(buffer.copyOfRange(0, 4))
+            }
+            prefixInt++
         }
     }
 
@@ -554,6 +639,14 @@ class MegaApi {
     }
 }
 
-class MegaApiException(val code: Int) : Exception("MEGA API error $code")
+class MegaApiException(val code: Int) : Exception(
+    when (code) {
+        -2, -9 -> "Wrong email or password (code $code)"
+        -3      -> "Server busy, please try again (code $code)"
+        -4      -> "Rate limited — too many requests (code $code)"
+        -16     -> "Account blocked (code $code)"
+        else    -> "MEGA API error $code"
+    }
+)
 
 // java.math.BigInteger used directly in decodeRsaSession
