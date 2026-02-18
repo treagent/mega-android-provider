@@ -1,0 +1,50 @@
+# Built application files
+*.apk
+*.aar
+*.ap_
+*.aab
+
+# Files for the ART/Dalvik VM
+*.dex
+
+# Java class files
+*.class
+
+# Generated files
+bin/
+gen/
+out/
+build/
+
+# Gradle files
+.gradle/
+!gradle/wrapper/gradle-wrapper.jar
+
+# Local configuration file (sdk path, etc)
+local.properties
+
+# Android Studio Navigation editor temp files
+.navigation/
+
+# Android Studio captures folder
+captures/
+
+# IntelliJ
+.idea/
+*.iml
+*.iws
+*.ipr
+
+# Keystore files (user must provide their own)
+*.jks
+*.keystore
+
+# MEGA SDK AAR (user-provided, not committed)
+app/libs/megasdk-android.aar
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Log files
+*.log

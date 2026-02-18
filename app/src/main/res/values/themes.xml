@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.MegaProvider" parent="Theme.MaterialComponents.Light.NoActionBar">
+        <item name="colorPrimary">#D32F2F</item>
+        <item name="colorPrimaryVariant">#B71C1C</item>
+        <item name="colorOnPrimary">@android:color/white</item>
+        <item name="colorSecondary">#D32F2F</item>
+    </style>
+</resources>

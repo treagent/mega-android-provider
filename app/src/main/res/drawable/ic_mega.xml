@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="48dp"
+    android:height="48dp"
+    android:viewportWidth="48"
+    android:viewportHeight="48">
+    <!-- Simple cloud icon representing MEGA cloud storage -->
+    <path
+        android:fillColor="#D32F2F"
+        android:pathData="M38.71,20.07C37.35,13.19 31.28,8 24,8c-5.78,0 -10.79,3.28 -13.3,8.08C4.69,16.72 0,21.82 0,28c0,6.63 5.37,12 12,12h26c5.52,0 10,-4.48 10,-10 0,-5.28 -4.11,-9.56 -9.29,-9.93z" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M16,28l4,-4 4,4 4,-4 4,4"
+        android:strokeWidth="2"
+        android:strokeColor="#FFFFFF"
+        android:fillAlpha="0" />
+</vector>
