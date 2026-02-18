@@ -36,8 +36,8 @@ class MegaApi {
 
     private val http = OkHttpClient.Builder()
         .connectTimeout(30, TimeUnit.SECONDS)
-        .readTimeout(120, TimeUnit.SECONDS)
-        .writeTimeout(120, TimeUnit.SECONDS)
+        .readTimeout(900, TimeUnit.SECONDS)   // 15 min — large accounts can have big trees
+        .writeTimeout(60, TimeUnit.SECONDS)
         .build()
 
     private val seqno = AtomicInteger(SecureRandom().nextInt().and(0x7FFFFFFF)) // must be positive
@@ -113,7 +113,7 @@ class MegaApi {
         val a = bytesToA32(password.toByteArray(Charsets.UTF_8))
         // Initial pkey constants from MEGA's reference implementation
         // Signed int32 equivalents of: 0x93C467E3, 0x7DB0C7A4, 0xD1BE3F81, 0x0152CB56
-        var pkey = intArrayOf(-1815939101, 2108737444, -776855679, 22203222)
+        var pkey = intArrayOf(-1815844893, 2108737444, -776061055, 22203222)
         repeat(0x10000) {           // 65536 rounds of key stretching
             var j = 0
             while (j < a.size) {
@@ -200,52 +200,73 @@ class MegaApi {
      * or throws MegaApiException on negative error codes.
      */
     fun apiReq(data: JSONObject): Any? {
-        val sid = sessionId
-        val params = buildString {
-            append("id=").append(seqno.getAndIncrement())
-            if (sid != null) append("&sid=").append(sid)
-        }
-        val url = "https://g.api.mega.co.nz/cs?$params"
-        val bodyStr = JSONArray().put(data).toString()
-
-        var hashcashHeader: String? = null
-
-        repeat(3) { attempt ->
-            val reqBuilder = Request.Builder().url(url)
-                .post(bodyStr.toRequestBody("application/json".toMediaType()))
-            hashcashHeader?.let { reqBuilder.header("X-Hashcash", it) }
-
-            val resp = http.newCall(reqBuilder.build()).execute()
-
-            if (resp.code == 402) {
-                // MEGA requires hashcash proof-of-work
-                val challenge = resp.header("X-Hashcash") ?: throw MegaApiException(-1)
-                resp.body?.close()
-                android.util.Log.d("MegaApi", "402 hashcash required: $challenge")
-                hashcashHeader = solveHashcash(challenge)
-                return@repeat // retry with hashcash header
+        // Outer loop: retry up to 4 times on EAGAIN (-3) with backoff
+        for (eagainAttempt in 0..3) {
+            if (eagainAttempt > 0) {
+                android.util.Log.d("MegaApi", "EAGAIN retry $eagainAttempt — waiting ${eagainAttempt * 2}s")
+                Thread.sleep(eagainAttempt * 2000L)
             }
 
-            val text = resp.body?.string() ?: throw MegaApiException(-1)
-            android.util.Log.d("MegaApi", "apiReq [${data.optString("a")}] → ${text.take(200)}")
+            val sid = sessionId
+            val params = buildString {
+                append("id=").append(seqno.getAndIncrement())
+                append("&ak=JeFpWcSL")          // registered API key (MEGAcmd)
+                if (sid != null) append("&sid=").append(sid)
+            }
+            val url = "https://g.api.mega.co.nz/cs?$params"
+            val bodyStr = JSONArray().put(data).toString()
 
-            return try {
-                val arr = JSONArray(text)
-                val first = arr.get(0)
-                val code = when (first) {
-                    is Int  -> first
-                    is Long -> first.toInt()
-                    else    -> null
+            var hashcashHeader: String? = null
+            var result: Any? = null
+            var gotResult = false
+            var isEagain = false
+
+            repeat(3) { _ ->
+                if (gotResult || isEagain) return@repeat
+                val reqBuilder = Request.Builder().url(url)
+                    .post(bodyStr.toRequestBody("application/json".toMediaType()))
+                hashcashHeader?.let { reqBuilder.header("X-Hashcash", it) }
+
+                val resp = http.newCall(reqBuilder.build()).execute()
+
+                if (resp.code == 402) {
+                    val challenge = resp.header("X-Hashcash") ?: run { gotResult = true; return@repeat }
+                    resp.body?.close()
+                    android.util.Log.d("MegaApi", "402 hashcash: $challenge")
+                    hashcashHeader = solveHashcash(challenge)
+                    return@repeat // retry with hashcash header
                 }
-                if (code != null && code < 0) throw MegaApiException(code)
-                first
-            } catch (e: org.json.JSONException) {
-                val code = text.trim().toIntOrNull()
-                if (code != null && code < 0) throw MegaApiException(code)
-                null
+
+                val text = resp.body?.string() ?: run { gotResult = true; return@repeat }
+                android.util.Log.d("MegaApi", "apiReq [${data.optString("a")}] → ${text.take(200)}")
+
+                try {
+                    val arr = JSONArray(text)
+                    val first = arr.get(0)
+                    val code = when (first) {
+                        is Int  -> first
+                        is Long -> first.toInt()
+                        else    -> null
+                    }
+                    when {
+                        code == -3 -> { isEagain = true }             // server busy → outer retry
+                        code != null && code < 0 -> throw MegaApiException(code)
+                        else -> { result = first; gotResult = true }
+                    }
+                } catch (e: org.json.JSONException) {
+                    val code = text.trim().toIntOrNull()
+                    when {
+                        code == -3 -> { isEagain = true }
+                        code != null && code < 0 -> throw MegaApiException(code)
+                        else -> { result = null; gotResult = true }
+                    }
+                }
             }
+
+            if (gotResult) return result
+            if (!isEagain) break  // hashcash exhausted (not eagain)
         }
-        throw MegaApiException(-3) // exhausted retries
+        throw MegaApiException(-3) // all retries exhausted
     }
 
     // ── MEGA Hashcash (anti-abuse proof-of-work) ──────────────────────────
@@ -273,37 +294,60 @@ class MegaApi {
         val tokenRaw = b64Decode(token)
         val rem = tokenRaw.size % 16
         val tokenPadded = if (rem != 0) tokenRaw + ByteArray(16 - rem) else tokenRaw
-        val slotSize = tokenPadded.size  // 48 bytes for typical MEGA tokens
+        val slotSize = tokenPadded.size
 
+        // Build the static suffix (replicated token, shared across threads, no nonce)
+        // We compute SHA-256 as:  SHA256( nonce[4] || sharedSuffix[12MB] )
+        // using sha.update(nonce) + sha.digest(sharedSuffix) — no per-thread copy needed.
         val numReplications = 262144
-        val buffer = ByteArray(4 + numReplications * slotSize)
-
-        // Fill buffer with replicated token
+        val sharedSuffix = ByteArray(numReplications * slotSize)
         for (i in 0 until numReplications) {
-            System.arraycopy(tokenPadded, 0, buffer, 4 + i * slotSize, slotSize)
+            System.arraycopy(tokenPadded, 0, sharedSuffix, i * slotSize, slotSize)
         }
 
-        // Search for a 4-byte prefix whose SHA-256 satisfies the threshold
-        val sha = MessageDigest.getInstance("SHA-256")
-        var prefixInt = 0
-        while (true) {
-            buffer[0] = (prefixInt shr 24).toByte()
-            buffer[1] = (prefixInt shr 16).toByte()
-            buffer[2] = (prefixInt shr 8).toByte()
-            buffer[3] = prefixInt.toByte()
+        // Parallel search across all CPU cores
+        val numThreads = Runtime.getRuntime().availableProcessors().coerceIn(2, 8)
+        val found = java.util.concurrent.atomic.AtomicInteger(Int.MIN_VALUE) // sentinel = not found
+        val latch = java.util.concurrent.CountDownLatch(numThreads)
+        android.util.Log.d("MegaApi", "Hashcash: easiness=$easiness threshold=$threshold threads=$numThreads")
 
-            sha.reset()
-            val hash = sha.digest(buffer)
-            val hashVal = ((hash[0].toLong() and 0xFF) shl 24) or
-                          ((hash[1].toLong() and 0xFF) shl 16) or
-                          ((hash[2].toLong() and 0xFF) shl 8) or
-                          (hash[3].toLong() and 0xFF)
-
-            if (hashVal <= threshold) {
-                return b64Encode(buffer.copyOfRange(0, 4))
-            }
-            prefixInt++
+        for (t in 0 until numThreads) {
+            val startNonce = t
+            Thread {
+                val sha = MessageDigest.getInstance("SHA-256")
+                val nonceBytes = ByteArray(4)
+                var nonce = startNonce
+                while (found.get() == Int.MIN_VALUE) {
+                    nonceBytes[0] = (nonce shr 24).toByte()
+                    nonceBytes[1] = (nonce shr 16).toByte()
+                    nonceBytes[2] = (nonce shr 8).toByte()
+                    nonceBytes[3] = nonce.toByte()
+                    sha.reset()
+                    sha.update(nonceBytes)                    // incremental: prepend 4-byte nonce
+                    val hash = sha.digest(sharedSuffix)      // then hash the shared suffix
+                    val hashVal = ((hash[0].toLong() and 0xFF) shl 24) or
+                                  ((hash[1].toLong() and 0xFF) shl 16) or
+                                  ((hash[2].toLong() and 0xFF) shl 8) or
+                                  (hash[3].toLong() and 0xFF)
+                    if (hashVal <= threshold) {
+                        found.compareAndSet(Int.MIN_VALUE, nonce)
+                        break
+                    }
+                    nonce += numThreads
+                }
+                latch.countDown()
+            }.also { it.isDaemon = true; it.priority = Thread.MAX_PRIORITY }.start()
         }
+
+        latch.await()
+        val nonceFound = found.get()
+        android.util.Log.d("MegaApi", "Hashcash solved: nonce=$nonceFound")
+        return b64Encode(byteArrayOf(
+            (nonceFound shr 24).toByte(),
+            (nonceFound shr 16).toByte(),
+            (nonceFound shr 8).toByte(),
+            nonceFound.toByte()
+        ))
     }
 
     // ── Login ─────────────────────────────────────────────────────────────
@@ -311,12 +355,55 @@ class MegaApi {
     /**
      * Login with email + password. Returns a combined session string:
      * "sessionId:base64(masterKey)" which can be passed to fastLogin().
+     *
+     * Supports both:
+     *   v1 accounts (pre-2016): AES key derived via prepare_key + 65536 rounds
+     *   v2 accounts (post-2016): AES key derived via PBKDF2-HMAC-SHA512
+     * We probe first with "us0" to determine which variant to use.
      */
     fun login(email: String, password: String): String {
-        val passwordKey = prepareKey(password)
-        val uh = stringHash(email, passwordKey)
+        val emailLower = email.trim().lowercase()
+
+        // --- Step 1: probe account to determine auth version ---
+        val saltResp = apiReq(
+            JSONObject().put("a", "us0").put("user", emailLower)
+        )
+        android.util.Log.d("MegaApi", "us0 response: $saltResp")
+
+        val passwordKey: IntArray
+        val uh: String
+
+        val saltObj = saltResp as? JSONObject
+        if (saltObj != null && saltObj.has("s")) {
+            // v2 account — PBKDF2-HMAC-SHA512 key derivation
+            android.util.Log.d("MegaApi", "Auth v2 (PBKDF2)")
+            val saltA32 = b64ToA32(saltObj.getString("s"))
+            val saltBytes = a32ToBytes(saltA32)
+            // PBKDF2-HMAC-SHA512: dklen=32 bytes (256 bits)
+            // first 16 bytes → AES-128 password key
+            // last  16 bytes (bytes 16–31) → user hash (sent as uh)
+            val dk = javax.crypto.SecretKeyFactory
+                .getInstance("PBKDF2WithHmacSHA512")
+                .generateSecret(
+                    javax.crypto.spec.PBEKeySpec(
+                        password.toCharArray(),
+                        saltBytes,
+                        100000,
+                        256   // 256 bits = 32 bytes
+                    )
+                ).encoded                              // 32 bytes
+            passwordKey = bytesToA32(dk.copyOfRange(0, 16))
+            uh = b64Encode(dk.copyOfRange(16, 32))
+        } else {
+            // v1 account — classic prepare_key + stringhash
+            android.util.Log.d("MegaApi", "Auth v1 (prepare_key)")
+            passwordKey = prepareKey(password)
+            uh = stringHash(emailLower, passwordKey)
+        }
+
+        // --- Step 2: authenticate ---
         val res = apiReq(
-            JSONObject().put("a", "us").put("user", email).put("uh", uh)
+            JSONObject().put("a", "us").put("user", emailLower).put("uh", uh)
         ) as? JSONObject ?: throw MegaApiException(-1)
 
         val encMk = b64ToA32(res.getString("k"))
@@ -332,7 +419,8 @@ class MegaApi {
             throw MegaApiException(-1)
         }
 
-        fetchNodes()
+        // Don't fetchNodes() here — do it lazily when browsing starts.
+        // This avoids a third hashcash round during login, which was causing -3 timeouts.
         return encodeSession(sessionId!!, masterKey!!)
     }
 
@@ -344,11 +432,102 @@ class MegaApi {
             val (sid, mk) = decodeSession(encodedSession)
             sessionId = sid
             masterKey = mk
-            fetchNodes()
+            // Don't fetchNodes() eagerly — load lazily on first browse
             true
         } catch (_: Exception) {
             sessionId = null
             masterKey = null
+            false
+        }
+    }
+
+    /** Call this before browsing to ensure nodes are loaded. */
+    val nodesLoaded: Boolean get() = nodeMap.isNotEmpty()
+
+    fun ensureNodes() {
+        if (nodeMap.isEmpty()) fetchNodes()
+    }
+
+    /** Force a full re-fetch (clears existing nodeMap first). */
+    fun refreshNodes() {
+        nodeMap.clear()
+        rootHandle = null
+        fetchNodes()
+    }
+
+    /**
+     * Fetch nodes with persistent retry. Retries on rate-limit (-3) or timeout.
+     * [onWait] is called on each retry with a human-readable status string.
+     * Keeps retrying indefinitely until success or non-retriable error.
+     */
+    fun fetchNodesRetry(onWait: (String) -> Unit = {}) {
+        var attempt = 0
+        while (true) {
+            attempt++
+            try {
+                nodeMap.clear(); rootHandle = null
+                fetchNodes()
+                return  // success
+            } catch (e: MegaApiException) {
+                if (e.code != -3) throw e  // not a rate limit — fail immediately
+                val waitSec = minOf(20 * attempt, 120)
+                onWait("Rate limited — waiting ${waitSec}s (attempt $attempt)…")
+                Thread.sleep(waitSec * 1000L)
+            } catch (e: Exception) {
+                // socket timeout or network error — backoff and retry
+                val waitSec = minOf(30 * attempt, 120)
+                onWait("Network error, retry in ${waitSec}s (attempt $attempt)…")
+                Thread.sleep(waitSec * 1000L)
+            }
+        }
+    }
+
+    // ── Node cache serialization ──────────────────────────────────────────
+
+    fun serializeNodes(): String {
+        val arr = JSONArray()
+        for ((_, ni) in nodeMap) {
+            arr.put(JSONObject().apply {
+                put("h",  ni.node.handle)
+                put("ph", ni.node.parentHandle)
+                put("n",  ni.node.name)
+                put("f",  ni.node.isFolder)
+                put("s",  ni.node.size)
+                put("m",  ni.node.modificationTime)
+                put("k",  JSONArray(ni.nodeKey.toList()))
+            })
+        }
+        return JSONObject().apply {
+            put("root",  rootHandle ?: "")
+            put("nodes", arr)
+        }.toString()
+    }
+
+    fun loadCachedNodes(json: String): Boolean {
+        return try {
+            val obj = JSONObject(json)
+            rootHandle = obj.optString("root").takeIf { it.isNotEmpty() }
+            val arr = obj.getJSONArray("nodes")
+            nodeMap.clear()
+            for (i in 0 until arr.length()) {
+                val n   = arr.getJSONObject(i)
+                val h   = n.getString("h")
+                val node = MegaNode(
+                    handle           = h,
+                    parentHandle     = n.getString("ph"),
+                    name             = n.getString("n"),
+                    isFolder         = n.getBoolean("f"),
+                    size             = n.getLong("s"),
+                    modificationTime = n.getLong("m")
+                )
+                val ka  = n.getJSONArray("k")
+                val key = IntArray(ka.length()) { ka.getInt(it) }
+                nodeMap[h] = NodeInternal(node, key)
+            }
+            android.util.Log.d("MegaApi", "Loaded ${nodeMap.size} nodes from cache")
+            true
+        } catch (e: Exception) {
+            android.util.Log.w("MegaApi", "loadCachedNodes failed: ${e.message}")
             false
         }
     }
@@ -423,13 +602,19 @@ class MegaApi {
                         val encKey = b64ToA32(rawKey)
                         val fullKey = decryptKey(encKey, mk)
 
-                        // File key: XOR halves. Folder key: use first 4 uint32s directly.
+                        // File key layout (8 uint32s): [a,b,c,d, e,f,g,h]
+                        //   AES key for content = [a^e, b^f, c^g, d^h]
+                        //   IV for AES-CTR      = [e, f, 0, 0]
+                        // Store 6 uint32s: [ak0,ak1,ak2,ak3, iv0,iv1]
+                        // Folder key: 4 uint32s used directly as AES key for attrs.
                         val actualKey = if (type == 0 && fullKey.size >= 8) {
                             intArrayOf(
                                 fullKey[0] xor fullKey[4],
                                 fullKey[1] xor fullKey[5],
                                 fullKey[2] xor fullKey[6],
-                                fullKey[3] xor fullKey[7]
+                                fullKey[3] xor fullKey[7],
+                                fullKey[4],   // IV high
+                                fullKey[5]    // IV low
                             )
                         } else {
                             fullKey.take(4).toIntArray()
@@ -469,6 +654,57 @@ class MegaApi {
             cur = nodeMap[cur.parentHandle]?.node ?: break
         }
         return false
+    }
+
+    // ── Streaming URL (for VLC / external players) ────────────────────────
+
+    /**
+     * Get a temporary HTTPS download URL for a file node.
+     * This URL can be passed directly to VLC or any media player for streaming.
+     * No decryption needed client-side — MEGA serves the raw encrypted bytes;
+     * for streaming we just need the HTTPS URL and the player handles transport.
+     *
+     * Note: MEGA files are AES-CTR encrypted at rest. The URL serves encrypted bytes.
+     * For proper playback, a decrypting proxy is needed. For now this returns the raw URL
+     * which works if the player/app handles MEGA's format, or we can stream-decrypt ourselves.
+     */
+    fun getDownloadUrl(handle: String): String {
+        val res = apiReq(
+            JSONObject().put("a", "g").put("g", 1).put("n", handle)
+        ) as? JSONObject ?: throw IllegalStateException("No URL returned for $handle")
+        return res.getString("g")
+    }
+
+    // ── Decryption helper ─────────────────────────────────────────────────
+
+    private fun aesKeyFrom(nodeKey: IntArray) = nodeKey.take(4).toIntArray()
+
+    private fun ivFromKey(nodeKey: IntArray): ByteArray =
+        if (nodeKey.size >= 6) a32ToBytes(intArrayOf(nodeKey[4], nodeKey[5], 0, 0))
+        else ByteArray(16)  // fallback IV=0 for old data
+
+    private fun decryptMegaBytes(encBytes: ByteArray, nodeKey: IntArray): ByteArray {
+        val cipher = Cipher.getInstance("AES/CTR/NoPadding")
+        cipher.init(
+            Cipher.DECRYPT_MODE,
+            SecretKeySpec(a32ToBytes(aesKeyFrom(nodeKey)), "AES"),
+            IvParameterSpec(ivFromKey(nodeKey))
+        )
+        return cipher.doFinal(encBytes)
+    }
+
+    /** Download + decrypt a file; returns raw decrypted bytes (for images etc). */
+    fun getDecryptedBytes(handle: String): ByteArray {
+        val internal = nodeMap[handle] ?: throw IllegalStateException("Node not found: $handle")
+        val res = apiReq(JSONObject().put("a", "g").put("g", 1).put("n", handle))
+            as? JSONObject ?: throw IllegalStateException("No download URL for $handle")
+        val dlUrl = res.getString("g")
+
+        val req = Request.Builder().url(dlUrl).build()
+        val encBytes = http.newCall(req).execute().body?.bytes()
+            ?: throw IllegalStateException("Empty response from MEGA CDN")
+
+        return decryptMegaBytes(encBytes, internal.nodeKey)
     }
 
     // ── Download ──────────────────────────────────────────────────────────
@@ -636,6 +872,174 @@ class MegaApi {
             nodeMap.remove(handle)
             true
         } catch (_: Exception) { false }
+    }
+
+    // ── Move node ─────────────────────────────────────────────────────────
+
+    fun moveNode(nodeHandle: String, targetHandle: String): Boolean {
+        return try {
+            apiReq(JSONObject().put("a", "m").put("n", nodeHandle).put("t", targetHandle))
+            nodeMap[nodeHandle]?.let { ni ->
+                nodeMap[nodeHandle] = NodeInternal(ni.node.copy(parentHandle = targetHandle), ni.nodeKey)
+            }
+            true
+        } catch (e: Exception) {
+            android.util.Log.w("MegaApi", "moveNode failed for $nodeHandle: ${e.message}")
+            false
+        }
+    }
+
+    // ── Batch API call (multiple commands in one HTTP request) ────────────
+
+    fun apiReqBatch(commands: List<JSONObject>): List<Any?> {
+        if (commands.isEmpty()) return emptyList()
+        for (eagainAttempt in 0..3) {
+            if (eagainAttempt > 0) {
+                android.util.Log.d("MegaApi", "EAGAIN batch retry $eagainAttempt")
+                Thread.sleep(eagainAttempt * 2000L)
+            }
+            val sid = sessionId
+            val params = buildString {
+                append("id=").append(seqno.getAndIncrement())
+                append("&ak=JeFpWcSL")
+                if (sid != null) append("&sid=").append(sid)
+            }
+            val url = "https://g.api.mega.co.nz/cs?$params"
+            val bodyArr = JSONArray()
+            commands.forEach { bodyArr.put(it) }
+            val bodyStr = bodyArr.toString()
+
+            var hashcashHeader: String? = null
+            var results: List<Any?>? = null
+            var isEagain = false
+
+            repeat(3) { _ ->
+                if (results != null || isEagain) return@repeat
+                val reqBuilder = Request.Builder().url(url)
+                    .post(bodyStr.toRequestBody("application/json".toMediaType()))
+                hashcashHeader?.let { reqBuilder.header("X-Hashcash", it) }
+
+                val resp = http.newCall(reqBuilder.build()).execute()
+                if (resp.code == 402) {
+                    val challenge = resp.header("X-Hashcash") ?: run { results = emptyList(); return@repeat }
+                    resp.body?.close()
+                    android.util.Log.d("MegaApi", "402 hashcash (batch): $challenge")
+                    hashcashHeader = solveHashcash(challenge)
+                    return@repeat
+                }
+
+                val text = resp.body?.string() ?: run { results = emptyList(); return@repeat }
+                android.util.Log.d("MegaApi", "apiReqBatch (${commands.size} cmds) → ${text.take(120)}")
+
+                try {
+                    val arr = JSONArray(text)
+                    val firstElem = arr.get(0)
+                    val firstCode = when (firstElem) { is Int -> firstElem; is Long -> firstElem.toInt(); else -> null }
+                    when {
+                        firstCode == -3 -> isEagain = true
+                        firstCode != null && firstCode < 0 -> throw MegaApiException(firstCode)
+                        else -> results = (0 until arr.length()).map { i -> arr.get(i) }
+                    }
+                } catch (e: org.json.JSONException) {
+                    val code = text.trim().toIntOrNull()
+                    when {
+                        code == -3 -> isEagain = true
+                        code != null && code < 0 -> throw MegaApiException(code)
+                        else -> results = emptyList()
+                    }
+                }
+            }
+            results?.let { return it }
+            if (!isEagain) break
+        }
+        throw MegaApiException(-3)
+    }
+
+    // ── Reorganize numbered sub-folders into chunked groups ───────────────
+    // e.g. folders "1".."18000" → groups "1 - 100", "101 - 200", etc.
+
+    data class ReorgResult(val groupsCreated: Int, val foldersMoved: Int, val errors: Int)
+
+    fun reorganizeNumberedFolders(
+        parentHandle: String,
+        chunkSize: Int = 100,
+        onProgress: (done: Int, total: Int, msg: String) -> Unit = { _, _, _ -> }
+    ): ReorgResult {
+        // 1. Find all numbered sub-folders
+        val children = getChildren(parentHandle)
+        val numbered = children
+            .filter { it.isFolder && it.name.trim().matches(Regex("^\\d+$")) }
+            .map { Pair(it.name.trim().toLong(), it) }
+            .sortedBy { it.first }
+
+        if (numbered.isEmpty()) return ReorgResult(0, 0, 0)
+
+        val total = numbered.size
+        var done = 0
+        var groupsCreated = 0
+        var foldersMoved = 0
+        var errors = 0
+
+        val groups = numbered.chunked(chunkSize)
+
+        for (group in groups) {
+            val first = group.first().first
+            val last  = group.last().first
+            val groupName = if (first == last) "$first" else "$first - $last"
+
+            onProgress(done, total, "Creating group \"$groupName\"…")
+
+            // Reuse existing group folder if already created (idempotent)
+            val existingGroup = getChildren(parentHandle)
+                .firstOrNull { it.isFolder && it.name == groupName }
+
+            val groupFolder = existingGroup ?: try {
+                createFolder(groupName, parentHandle)
+            } catch (e: Exception) {
+                android.util.Log.w("MegaApi", "Failed to create group $groupName: ${e.message}")
+                null
+            }
+
+            if (groupFolder == null) {
+                errors += group.size
+                done   += group.size
+                continue
+            }
+            if (existingGroup == null) groupsCreated++
+
+            // Batch move — 50 per request to stay within MEGA limits
+            val batchSize = 50
+            for (batch in group.chunked(batchSize)) {
+                onProgress(done, total, "Moving ${batch.size} folders → \"$groupName\"…")
+                val moveCmds = batch.map { (_, node) ->
+                    JSONObject().put("a", "m").put("n", node.handle).put("t", groupFolder.handle)
+                }
+                try {
+                    val results = apiReqBatch(moveCmds)
+                    for ((idx, result) in results.withIndex()) {
+                        val (_, node) = batch[idx]
+                        val code = when (result) { is Int -> result; is Long -> result.toInt(); else -> 0 }
+                        if (code < 0) {
+                            android.util.Log.w("MegaApi", "Move failed for ${node.handle}: code $code")
+                            errors++
+                        } else {
+                            nodeMap[node.handle]?.let { ni ->
+                                nodeMap[node.handle] = NodeInternal(
+                                    ni.node.copy(parentHandle = groupFolder.handle), ni.nodeKey)
+                            }
+                            foldersMoved++
+                        }
+                    }
+                } catch (e: Exception) {
+                    android.util.Log.w("MegaApi", "Batch move error: ${e.message}")
+                    errors += batch.size
+                }
+                done += batch.size
+                onProgress(done, total, "Moved $done / $total…")
+            }
+        }
+
+        return ReorgResult(groupsCreated, foldersMoved, errors)
     }
 }
 

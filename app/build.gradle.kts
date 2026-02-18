@@ -60,6 +60,8 @@ dependencies {
     // HTTP client — replaces native MEGA SDK
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
 
+    implementation("androidx.viewpager2:viewpager2:1.0.0")
+    implementation("io.coil-kt:coil:2.5.0")          // image loading + caching
     // No native MEGA SDK required — pure Kotlin HTTP implementation built in
 
     testImplementation("junit:junit:4.13.2")

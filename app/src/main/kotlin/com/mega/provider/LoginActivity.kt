@@ -51,6 +51,15 @@ class LoginActivity : AppCompatActivity() {
         logoutButton.visibility = View.VISIBLE
         statusText.visibility = View.VISIBLE
         statusText.text = getString(R.string.logged_in_message)
+
+        // Show "Browse Files" button that opens MEGA in the system file manager
+        val browseBtn = findViewById<Button?>(R.id.browse_button)
+        browseBtn?.visibility = View.VISIBLE
+        browseBtn?.setOnClickListener { openMegaInFilePicker() }
+    }
+
+    private fun openMegaInFilePicker() {
+        startActivity(android.content.Intent(this, FileBrowserActivity::class.java))
     }
 
     private fun showLoggedOutState() {
@@ -73,9 +82,12 @@ class LoginActivity : AppCompatActivity() {
         }
 
         setLoading(true)
+        statusText.visibility = View.VISIBLE
+        statusText.text = "Checking account…"
 
         CoroutineScope(Dispatchers.IO).launch {
             try {
+                withContext(Dispatchers.Main) { statusText.text = "Security challenge (may take 30–60s)…" }
                 val session = MegaClientHolder.login(email, password)
                 MegaSessionManager.saveSession(this@LoginActivity, session)
 
@@ -91,6 +103,7 @@ class LoginActivity : AppCompatActivity() {
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) {
                     setLoading(false)
+                    statusText.visibility = View.GONE
                     Toast.makeText(
                         this@LoginActivity,
                         getString(R.string.login_failed, e.message),
